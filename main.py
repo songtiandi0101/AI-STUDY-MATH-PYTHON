@@ -1,58 +1,30 @@
 import base64
-import oss2
-import uuid
+import json
 import io
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
+import cv2
 import numpy as np
-from matplotlib import font_manager
 from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from typing import TypedDict
-from fastapi.middleware.cors import CORSMiddleware
 
 # ===================== 配置区 =====================
 DEEPSEEK_API_KEY = ""
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-MODEL_NAME = "deepseek-flash"  # 确保你的 API 支持多模态
+MODEL_NAME = "deepseek-flash"
 
-OSS_ACCESS_KEY_ID = ""
-OSS_ACCESS_KEY_SECRET = ""
-OSS_ENDPOINT = "oss-cn-beijing.aliyuncs.com"
-OSS_BUCKET_NAME = "math-question-img"
-
-PROMPT_QUESTION = "识别图片里面的数学题干，只输出题干文字，不要答案、不要解析、不要多余内容"
-PROMPT_EXPR = """
-从下面数学题干中提取函数表达式，只输出表达式，严格遵守：
-1. 有函数就输出，例如：(np.exp(x)-np.exp(-x))/(x**2)
-2. 没有函数图像、不需要绘图，直接输出 NONE
-3. 不要解释、不要markdown、不要多余文字
-题干：
+PROMPT_QUESTION = """
+请识别图片里的数学题目。请严格按以下 JSON 格式输出，不要包含任何 Markdown 标记或多余文字：
+{
+  "question": "提取的纯题干文字内容",
+  "has_image": true 或 false (判断原图中是否包含几何图形、函数图像等视觉元素，纯文字为 false)
+}
 """
 # ===================================================
 
-# ================= 全局 Matplotlib 风格配置 =================
-# 1. 配置数学公式渲染器 (用于漂亮地显示公式)
-plt.rcParams['mathtext.fontset'] = 'cm'  # 使用 Computer Modern 学术字体
-# 2. 自动寻找系统中文字体
-system_fonts = set(f.name for f in font_manager.fontManager.ttflist)
-for font in ['Microsoft YaHei', 'PingFang SC', 'WenQuanYi Zen Hei', 'SimHei']:
-    if font in system_fonts:
-        plt.rcParams['font.sans-serif'] = [font]
-        break
-plt.rcParams['axes.unicode_minus'] = False
-
-# 主题配色（干净、淡雅）
-COLOR_LINE = "#409EFF"  # 主线条颜色（蓝色）
-COLOR_AXIS = "#909399"  # 坐标轴颜色（浅灰）
-COLOR_GRID = "#F2F6FC"  # 网格线颜色（极浅蓝灰）
-COLOR_TEXT = "#606266"  # 刻度文字颜色
-# ============================================================
-
-app = FastAPI(title="手机习题识别+自动绘图（不存原图）")
+app = FastAPI(title="习题识别接口")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -61,14 +33,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-auth = oss2.Auth(OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET)
-bucket = oss2.Bucket(auth, OSS_ENDPOINT, OSS_BUCKET_NAME)
-
 
 class GraphState(TypedDict):
     img_data_url: str
     question_text: str
-    expr_text: str
+    has_image: bool
 
 
 def recognize_question(state: GraphState):
@@ -78,134 +47,107 @@ def recognize_question(state: GraphState):
         {"type": "image_url", "image_url": {"url": state["img_data_url"]}}
     ])
     resp = llm.invoke([msg])
-    return {"question_text": resp.content}
 
-
-def extract_expr(state: GraphState):
-    llm = ChatOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL, model=MODEL_NAME, temperature=0.1)
-    msg = HumanMessage(content=PROMPT_EXPR + state["question_text"])
-    resp = llm.invoke([msg])
-    return {"expr_text": resp.content.strip()}
-
-
-# 节点3：终极美化绘图
-def draw_function(expr: str):
-    # 创建画布，高分辨率
-    fig, ax = plt.subplots(figsize=(6, 6), dpi=300)
-    fig.patch.set_facecolor('#FFFFFF')
-    ax.set_facecolor('#FFFFFF')
-
-    x_min, x_max = -10, 10
-    y_min, y_max = -10, 10
-    x = np.linspace(x_min, x_max, 2000)
-
-    safe_ns = {"np": np, "x": x}
     try:
-        y = eval(expr, safe_ns, {})
-        # 画函数曲线（渐变色视觉：深蓝实线，加上一点阴影或者直接实线）
-        ax.plot(x, y, color=COLOR_LINE, linewidth=3, solid_capstyle='round', antialiased=True)
+        content = resp.content.strip().replace("```json", "").replace("```", "")
+        data = json.loads(content)
+        return {
+            "question_text": data.get("question", ""),
+            "has_image": data.get("has_image", False)
+        }
     except Exception as e:
-        print(f"绘图失败，表达式可能不支持: {e}")
-        return None
-
-    # 将计算机公式转为 LaTeX 格式用于渲染
-    # 例如：(np.exp(x)-np.exp(-x))/(x**2) -> \frac{e^x - e^{-x}}{x^2}
-    latex_expr = expr
-    latex_expr = latex_expr.replace("np.exp(x)", "e^x").replace("np.exp(-x)", "e^{-x}")
-    latex_expr = latex_expr.replace("**", "^").replace("*", " \\cdot ")
-    if "/" in latex_expr and "^" in latex_expr:
-        # 尝试给简单除法加个大括号让渲染像分数（注意：复杂正则处理，如果没括号可能会显示不完美）
-        latex_expr = latex_expr.replace("(", "\\left(").replace(")", "\\right)")
-
-    # 在图表左上角标注公式，使用数学字体
-    # 使用 bbox 画一个半透明白色圆角背景，防止公式被曲线遮挡
-    ax.text(0.05, 0.95, f"$y = {latex_expr}$",
-            transform=ax.transAxes,
-            fontsize=20,
-            color="#303133",
-            verticalalignment='top',
-            bbox=dict(boxstyle="round,pad=0.4", fc="#FFFFFF", ec="#EBEEF5", alpha=0.9, linewidth=1))
-
-    # 隐藏上、右、左、下边框，完全依靠网格线支撑视觉
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.spines['left'].set_visible(False)
-    ax.spines['bottom'].set_visible(False)
-
-    # 绘制十字坐标轴（带箭头指示正方向）
-    ax.axhline(y=0, color=COLOR_AXIS, linewidth=1.2, zorder=3)
-    ax.axvline(x=0, color=COLOR_AXIS, linewidth=1.2, zorder=3)
-
-    # 坐标轴箭头
-    ax.plot(1, 0, ">k", transform=ax.get_yaxis_transform(), clip_on=False, color=COLOR_AXIS, markersize=5)
-    ax.plot(0, 1, "^k", transform=ax.get_xaxis_transform(), clip_on=False, color=COLOR_AXIS, markersize=5)
-    # 原点标签
-    ax.text(0, 0, 'O', fontsize=12, color=COLOR_TEXT, ha='right', va='top', transform=ax.transData)
-
-    # 范围与刻度设置
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    # 隐藏默认的边框刻度线，只保留文字
-    ax.tick_params(axis='both', colors=COLOR_TEXT, labelsize=10, length=0, pad=8)
-
-    # 网格（坐标轴对齐）
-    ax.grid(True, color=COLOR_GRID, linestyle='-', linewidth=1, zorder=0)
-
-    # 刻度对齐设置，每2格显示一次
-    ax.xaxis.set_major_locator(ticker.MultipleLocator(2))
-    ax.yaxis.set_major_locator(ticker.MultipleLocator(2))
-
-    # 留白自适应
-    plt.tight_layout()
-
-    # 导出内存图片
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.2, facecolor=fig.get_facecolor())
-    buf.seek(0)
-    plt.close(fig)
-    return buf.read()
+        print("JSON解析失败:", e)
+        return {"question_text": resp.content, "has_image": False}
 
 
-# 构建 LangGraph 链路
 builder = StateGraph(GraphState)
 builder.add_node("recognize_question", recognize_question)
-builder.add_node("extract_expr", extract_expr)
 builder.add_edge(START, "recognize_question")
-builder.add_edge("recognize_question", "extract_expr")
-builder.add_edge("extract_expr", END)
+builder.add_edge("recognize_question", END)
 graph = builder.compile()
 
 
-@app.post("/upload_image")
-async def upload_image(file: UploadFile = File(...)):
+# ==================== 智能图像裁剪核心逻辑 ====================
+def crop_image_keep_only_graphics(img_bytes: bytes):
+    """
+    使用 OpenCV 投影法自动去除顶部题干文字，只保留下方的图像区域
+    """
+    try:
+        # 1. 将字节流转换为 OpenCV 图像
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return img_bytes  # 解析失败原图返回
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # 2. 二值化处理（黑字白底）
+        _, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+
+        # 3. 计算水平方向上的黑像素投影（每一行有多少个黑点）
+        row_sums = np.sum(thresh, axis=1)
+
+        # 4. 找到连续有黑像素（或一定量黑像素）的起始和结束行
+        # 如果某行黑像素极少，说明是空白处，视为文字与图像的分割点
+        valid_rows = np.where(row_sums > 5)[0]
+        if len(valid_rows) == 0:
+            return img_bytes  # 全白图，直接返回
+
+        # 寻找中间最大的空白跳跃段
+        gaps = np.diff(valid_rows)
+        max_gap_idx = np.argmax(gaps)
+
+        # 如果找到明显的空白间隔，且间隔下方仍有图像，则切分
+        if gaps[max_gap_idx] > 20:
+            # 取间隔下方作为图像的起始位置
+            start_y = valid_rows[max_gap_idx + 1]
+            # 底部留一点边距
+            end_y = min(valid_rows[-1] + 20, img.shape[0])
+
+            # 裁切图像
+            cropped = img[start_y:end_y, :]
+            # 可选：对裁剪后的图像进行高清放大（2倍）
+            # cropped = cv2.resize(cropped, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        else:
+            cropped = img
+
+        # 5. 转换回 bytes 格式
+        _, buffer = cv2.imencode('.png', cropped)
+        return buffer.tobytes()
+    except Exception as e:
+        print("图片裁剪失败:", e)
+        return img_bytes
+
+
+# ===================================================
+
+
+# ==================== 接口定义 ====================
+@app.post("/recognize_only")
+async def recognize_only(file: UploadFile = File(...)):
     img_bytes = await file.read()
     mime = file.content_type
 
     b64 = base64.b64encode(img_bytes).decode("utf-8")
     img_data_url = f"data:{mime};base64,{b64}"
 
-    out = graph.invoke({"img_data_url": img_data_url, "question_text": "", "expr_text": ""})
-    question = out["question_text"]
-    expr = out["expr_text"]
+    # 跑大模型链路
+    out = graph.invoke({"img_data_url": img_data_url, "question_text": "", "has_image": False})
 
-    draw_img_url = None
-    draw_img_key = None
-    if expr != "NONE":
-        draw_bytes = draw_function(expr)
-        if draw_bytes is not None:
-            draw_key = f"question_draw/{uuid.uuid4()}.png"
-            bucket.put_object(draw_key, draw_bytes)
-            draw_img_url = f"https://{OSS_BUCKET_NAME}.{OSS_ENDPOINT}/{draw_key}"
-            draw_img_key = draw_key
+    image_base64 = ""
+    if out["has_image"]:
+        # 【核心修改】：自动裁剪，去掉题干文字，仅保留图像
+        cropped_bytes = crop_image_keep_only_graphics(img_bytes)
+        # 将裁剪后的图片转为 Base64 发给前端展示
+        b64_cropped = base64.b64encode(cropped_bytes).decode("utf-8")
+        image_base64 = f"data:image/png;base64,{b64_cropped}"
 
     return {
         "code": 200,
         "msg": "识别完成",
         "data": {
-            "question": question,
-            "func_expr": expr,
-            "draw_img_key": draw_img_key,
-            "draw_img_url": draw_img_url
+            "question": out["question_text"],
+            "has_image": out["has_image"],
+            "image_base64": image_base64
         }
     }
 
